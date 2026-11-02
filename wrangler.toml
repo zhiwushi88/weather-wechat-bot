@@ -1,0 +1,18 @@
+name = "weather-wechat-bot"
+main = "src/index.js"
+compatibility_date = "2024-09-01"
+
+# 每小时整点触发（UTC 0-12 点 = 北京时间 8:00-20:00，正好覆盖监测窗口）
+[triggers]
+crons = ["0 0-12 * * *"]
+
+[vars]
+# 至少几个天气源一致报雨才推送（防止单一来源误报）
+MIN_SOURCES = "2"
+# 单源降雨概率阈值（%）
+RAIN_PROB_THRESHOLD = "50"
+
+# 用于"同一天同时段不重复推送"的去重存储（免费额度足够）
+[[kv_namespaces]]
+binding = "KV"
+id = "REPLACE_WITH_YOUR_KV_ID"
