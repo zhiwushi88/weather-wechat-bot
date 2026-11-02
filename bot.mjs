@@ -1,11 +1,11 @@
 /**
  * weather-wechat-bot（GitHub Actions 版）
- * 由 .github/workflows/weather.yml 每小时（北京时间 8-20 点）调度：
- * 多天气源交叉验证，可能降雨才发送邮件提醒，同一天同时段不重复推送。
+ * 每天北京时间 07:30 运行一次：
+ * 通过 Open-Meteo 的两个独立气象模型（best_match + ECMWF）交叉验证，
+ * 检查当日 08:00–20:00 是否有雨，有雨则发送邮件警报，无雨则不发送。
  */
 
 import tls from 'node:tls';
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 
 const TIMEZONE = 'Asia/Shanghai';
 const WINDOW_START = 8;
@@ -17,21 +17,17 @@ const REGIONS = [
 ];
 
 const RAIN_CODES = new Set([51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82, 95, 96, 99]);
-const MIN_SOURCES = Math.max(1, Number(process.env.MIN_SOURCES) || 1);
-const THRESHOLD = Number(process.env.RAIN_PROB_THRESHOLD) || 50;
+const THRESHOLD = 50;
+const MIN_SOURCES = 2;
 
-const { date, hour } = nowParts();
-if (hour < WINDOW_START || hour > WINDOW_END) {
-  console.log(`当前北京时间 ${hour} 时，不在监测窗口内，退出`);
-  process.exit(0);
-}
+/* ----------------------------- 数据源 ----------------------------- */
 
-const sources = [
-  {
-    name: 'Open-Meteo',
-    async fetch(region) {
+function makeOpenMeteoSource(modelName, label) {
+  return {
+    name: label,
+    async fetch(region, date) {
       const url = `https://api.open-meteo.com/v1/forecast?latitude=${region.lat}&longitude=${region.lon}`
-        + `&hourly=precipitation_probability,precipitation,weather_code&timezone=${encodeURIComponent(TIMEZONE)}&forecast_days=2`;
+        + `&hourly=precipitation_probability,precipitation,weather_code&models=${modelName}&timezone=${encodeURIComponent(TIMEZONE)}&forecast_days=2`;
       const d = await fetchJSON(url);
       const rainHours = new Set(), probByHour = new Map();
       d.hourly.time.forEach((t, i) => {
@@ -46,13 +42,20 @@ const sources = [
       });
       return { name: this.name, rainHours, probByHour };
     },
-  },
+  };
+}
+
+const sources = [
+  makeOpenMeteoSource('best_match', 'Open-Meteo (综合模型)'),
+  makeOpenMeteoSource('ecmwf_ifs025', 'Open-Meteo (ECMWF模型)'),
 ];
+
+// Optional extra sources if keys provided
 if (process.env.QWEATHER_KEY) {
   sources.push({
     name: '和风天气',
-    async fetch(region) {
-      const d = await fetchJSON(`https://devapi.qweather.com/v7/weather/24h?location=${region.lon},${region.lat}&key=${process.env.QWEATHER_KEY}`);
+    async fetch(region, date) {
+      const d = await fetchJSON(`https://devapi.qweather.com/v7/weather/24h?location=${region.lon},${region.lat}&key=***}`);
       if (String(d.code) !== '200') throw new Error(`qweather code=${d.code}`);
       const rainHours = new Set(), probByHour = new Map();
       for (const it of d.hourly || []) {
@@ -70,7 +73,7 @@ if (process.env.QWEATHER_KEY) {
 if (process.env.OWM_KEY) {
   sources.push({
     name: 'OpenWeatherMap',
-    async fetch(region) {
+    async fetch(region, date) {
       const d = await fetchJSON(`https://api.openweathermap.org/data/2.5/forecast?lat=${region.lat}&lon=${region.lon}&appid=${process.env.OWM_KEY}&units=metric`);
       const rainHours = new Set(), probByHour = new Map();
       for (const it of d.list || []) {
@@ -86,28 +89,36 @@ if (process.env.OWM_KEY) {
   });
 }
 
-let hasNew = false;
+/* ----------------------------- 主逻辑 ----------------------------- */
+
+const { date, hour } = nowParts();
+console.log(`运行时间：${date} ${hour}:00 北京时间`);
+
+let hasAlert = false;
+
 for (const region of REGIONS) {
   try {
-    const results = await Promise.allSettled(sources.map(s => s.fetch(region)));
+    const results = await Promise.allSettled(sources.map(s => s.fetch(region, date)));
     const ok = [];
     results.forEach((r, i) => {
       if (r.status === 'fulfilled') ok.push(r.value);
       else console.warn(`[${region.id}] 源 ${sources[i].name} 不可用:`, r.reason?.message);
     });
-    if (!ok.length) { console.error(`[${region.id}] 所有天气源失败，下次自动重试`); continue; }
 
-    const votes = ok.filter(s => s.rainHours.size > 0);
-    let shouldNotify = votes.length >= MIN_SOURCES;
-    let reason = `${votes.length}/${ok.length} 个来源一致预报有雨`;
-    if (!shouldNotify && ok.length === 1 && votes.length === 1) {
-      const maxProb = Math.max(0, ...[...ok[0].probByHour.values()]);
-      shouldNotify = maxProb >= Math.max(THRESHOLD, 60);
-      reason = `仅 ${ok[0].name} 可用，其降雨概率 ${maxProb}%`;
+    if (ok.length < MIN_SOURCES) {
+      console.error(`[${region.id}] 可用源不足（${ok.length}个），需要至少${MIN_SOURCES}个，跳过`);
+      continue;
     }
-    console.log(`[${region.id}] votes=${votes.length}/${ok.length} -> ${shouldNotify ? '通知' : '静默'}`);
-    if (!shouldNotify) continue;
 
+    // Cross-validation: at least MIN_SOURCES sources must agree on rain
+    const votes = ok.filter(s => s.rainHours.size > 0);
+    const shouldAlert = votes.length >= MIN_SOURCES;
+
+    console.log(`[${region.id}] ${ok.length}个源，${votes.length}个预报有雨 -> ${shouldAlert ? '发送警报' : '无雨，不发送'}`);
+
+    if (!shouldAlert) continue;
+
+    // Determine rain hours (majority vote)
     const hourVotes = new Map();
     for (const s of ok) for (const h of s.rainHours) {
       if (!hourVotes.has(h)) hourVotes.set(h, []);
@@ -118,22 +129,20 @@ for (const region of REGIONS) {
       (names.length >= Math.min(MIN_SOURCES, ok.length) ? confirmed : possible).add(h);
     }
 
-    const st = loadState(region.id, date);
-    const newC = [...confirmed].filter(h => !st.confirmed.includes(h));
-    const newP = [...possible].filter(h => !st.possible.includes(h));
-    if (!newC.length && !newP.length) { console.log(`[${region.id}] 无新增降雨时段，不重复通知`); continue; }
-    st.confirmed.push(...newC);
-    st.possible.push(...newP);
-    saveState(region.id, date, st);
-    hasNew = true;
-
-    await notify(region, buildMessage(region, date, ok, confirmed, possible));
+    const message = buildMessage(region, date, ok, confirmed, possible);
+    await sendEmail(region.email, `☔ 天气警报 | ${region.name}`, message);
+    console.log(`已发送警报邮件到 ${region.email}`);
+    hasAlert = true;
   } catch (e) {
     console.error(`[${region.id}] 处理失败:`, e.stack || e);
   }
 }
 
-/* ----------------------------- 工具 ----------------------------- */
+if (!hasAlert) {
+  console.log('所有地区今日无雨，不发送邮件。');
+}
+
+/* ----------------------------- 工具函数 ----------------------------- */
 
 function nowParts() {
   const f = new Intl.DateTimeFormat('en-CA', {
@@ -144,28 +153,15 @@ function nowParts() {
   return { date: `${p.year}-${p.month}-${p.day}`, hour: Number(p.hour) };
 }
 
-async function fetchJSON(url, opts = {}, timeoutMs = 12000) {
+async function fetchJSON(url, opts = {}, timeoutMs = 15000) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), timeoutMs);
   try {
-    const r = await fetch(url, { ...opts, signal: ctl.signal });
+    const r = await fetch(url, { ...opts, signal: ctl.signal, headers: { 'User-Agent': 'weather-bot/1.0', ...(opts.headers || {}) } });
     if (!r.ok) throw new Error(`HTTP ${r.status} ${url.split('?')[0]}`);
     return await r.json();
   } finally { clearTimeout(timer); }
 }
-
-function stateFile(regionId) {
-  mkdirSync('state', { recursive: true });
-  return `state/${regionId}.json`;
-}
-function loadState(regionId, date) {
-  try {
-    const v = JSON.parse(readFileSync(stateFile(regionId), 'utf8'));
-    if (v.date === date) return v;
-  } catch { /* 首次运行无文件 */ }
-  return { date, confirmed: [], possible: [] };
-}
-function saveState(regionId, date, st) { writeFileSync(stateFile(regionId), JSON.stringify(st)); }
 
 function buildMessage(region, date, okSources, confirmed, possible) {
   const fmtH = h => `${String(h).padStart(2, '0')}时`;
@@ -181,12 +177,16 @@ function buildMessage(region, date, okSources, confirmed, possible) {
     return `- ${s.name}：${hours.length ? hours.map(h => `${fmtH(h)}(${s.probByHour.get(h) ?? '?'}%)`).join(' ') : '无雨'}`;
   }).join('\n');
   return [
-    `☔ 天气提醒 | ${region.name}`,
+    `☔ 天气警报 | ${region.name}`,
     `今日（${date}）08:00–20:00 预计有雨`,
     confirmed.size ? `🌧 大概率降雨时段：${groupHours(confirmed)}` : '',
     possible.size ? `🌦 次要来源提示可能有雨：${groupHours(possible)}` : '',
+    ``,
     `各来源预报：`,
     srcLine,
+    ``,
+    `---`,
+    `数据来源：${okSources.map(s => s.name).join(' + ')}`,
   ].filter(Boolean).join('\n');
 }
 
@@ -280,11 +280,4 @@ async function sendEmail(to, subject, body) {
       socket.setTimeout(30000, () => done(new Error('SMTP 连接超时')));
     });
   });
-}
-
-async function notify(region, message) {
-  const to = region.email;
-  const subject = `☔ 天气提醒 | ${region.name}`;
-  await sendEmail(to, subject, message);
-  console.log(`已发送邮件到 ${to}`);
 }
