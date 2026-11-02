@@ -1,23 +1,23 @@
 /**
  * weather-wechat-bot（GitHub Actions 版）
  * 由 .github/workflows/weather.yml 每小时（北京时间 8-20 点）调度：
- * 多天气源交叉验证，可能降雨才推送到微信，同一天同时段不重复推送。
- * 与 Cloudflare Workers 版逻辑一致，方便二选一部署或互为备份。
+ * 多天气源交叉验证，可能降雨才发送邮件提醒，同一天同时段不重复推送。
  */
 
+import tls from 'node:tls';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 
 const TIMEZONE = 'Asia/Shanghai';
-const WINDOW_START = 8;  // 北京时间 08:00 开始
-const WINDOW_END = 20;   // 20:00 结束（检查 8..19 这 12 个时段）
+const WINDOW_START = 8;
+const WINDOW_END = 20;
 
 const REGIONS = [
-  { id: 'huaxi',    name: '贵阳·花溪区',       lat: 26.4306, lon: 106.6703 },
-  { id: 'shangjie', name: '福州·闽侯县上街镇', lat: 26.0830, lon: 119.2090 },
+  { id: 'huaxi',    name: '贵阳·花溪区',       lat: 26.4306, lon: 106.6703, email: '1418043295@qq.com' },
+  { id: 'shangjie', name: '福州·闽侯县上街镇', lat: 26.0830, lon: 119.2090, email: '1634527469@qq.com' },
 ];
 
 const RAIN_CODES = new Set([51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82, 95, 96, 99]);
-const MIN_SOURCES = Math.max(1, Number(process.env.MIN_SOURCES) || 2);
+const MIN_SOURCES = Math.max(1, Number(process.env.MIN_SOURCES) || 1);
 const THRESHOLD = Number(process.env.RAIN_PROB_THRESHOLD) || 50;
 
 const { date, hour } = nowParts();
@@ -108,7 +108,6 @@ for (const region of REGIONS) {
     console.log(`[${region.id}] votes=${votes.length}/${ok.length} -> ${shouldNotify ? '通知' : '静默'}`);
     if (!shouldNotify) continue;
 
-    // 时段投票：多数源都报雨 = 大概率；只有单源报雨 = 可能有雨
     const hourVotes = new Map();
     for (const s of ok) for (const h of s.rainHours) {
       if (!hourVotes.has(h)) hourVotes.set(h, []);
@@ -119,7 +118,6 @@ for (const region of REGIONS) {
       (names.length >= Math.min(MIN_SOURCES, ok.length) ? confirmed : possible).add(h);
     }
 
-    // 去重（state 目录由 actions/cache 保存）
     const st = loadState(region.id, date);
     const newC = [...confirmed].filter(h => !st.confirmed.includes(h));
     const newP = [...possible].filter(h => !st.possible.includes(h));
@@ -129,13 +127,11 @@ for (const region of REGIONS) {
     saveState(region.id, date, st);
     hasNew = true;
 
-    await notify(buildMessage(region, date, ok, confirmed, possible));
+    await notify(region, buildMessage(region, date, ok, confirmed, possible));
   } catch (e) {
     console.error(`[${region.id}] 处理失败:`, e.stack || e);
   }
 }
-
-// 若当天到 20 点后仍无任何状态文件，也不需要特殊处理；缓存按天自然被新 key 覆盖
 
 /* ----------------------------- 工具 ----------------------------- */
 
@@ -185,30 +181,110 @@ function buildMessage(region, date, okSources, confirmed, possible) {
     return `- ${s.name}：${hours.length ? hours.map(h => `${fmtH(h)}(${s.probByHour.get(h) ?? '?'}%)`).join(' ') : '无雨'}`;
   }).join('\n');
   return [
-    `☔ **天气提醒 | ${region.name}**`,
+    `☔ 天气提醒 | ${region.name}`,
     `今日（${date}）08:00–20:00 预计有雨`,
-    confirmed.size ? `🌧 **大概率降雨时段：${groupHours(confirmed)}**` : '',
+    confirmed.size ? `🌧 大概率降雨时段：${groupHours(confirmed)}` : '',
     possible.size ? `🌦 次要来源提示可能有雨：${groupHours(possible)}` : '',
-    `**各来源预报：**`,
+    `各来源预报：`,
     srcLine,
   ].filter(Boolean).join('\n');
 }
 
-async function notify(message) {
-  const jobs = [];
-  if (process.env.WECOM_WEBHOOK) {
-    jobs.push(fetchJSON(process.env.WECOM_WEBHOOK, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ msgtype: 'markdown', markdown: { content: message } }),
-    }).then(r => { if (r.errcode !== 0) throw new Error(`wecom errcode=${r.errcode}`); console.log('已推送到企业微信'); }));
-  }
-  if (process.env.SERVERCHAN_KEY) {
-    jobs.push(fetchJSON(`https://sctapi.ftqq.com/${process.env.SERVERCHAN_KEY}.send`, {
-      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: `title=${encodeURIComponent('☔ 天气提醒：今日可能有雨')}&desp=${encodeURIComponent(message)}`,
-    }));
-  }
-  if (!jobs.length) throw new Error('未配置推送渠道！请在仓库 Secrets 中设置 WECOM_WEBHOOK 或 SERVERCHAN_KEY');
-  const rs = await Promise.allSettled(jobs);
-  rs.filter(r => r.status === 'rejected').forEach(r => console.error('推送失败:', r.reason?.message));
+/* ----------------------------- SMTP 邮件 ----------------------------- */
+
+async function sendEmail(to, subject, body) {
+  const user = process.env.QQ_SMTP_USER;
+  const pass = process.env.QQ_SMTP_PASS;
+  if (!user || !pass) throw new Error('QQ_SMTP_USER 或 QQ_SMTP_PASS 未设置');
+
+  return new Promise((resolve, reject) => {
+    const socket = tls.connect(465, 'smtp.qq.com', { rejectUnauthorized: true }, () => {
+      let step = 0;
+      let buffer = '';
+      let settled = false;
+
+      const done = (err) => {
+        if (settled) return;
+        settled = true;
+        try { socket.destroy(); } catch {}
+        if (err) reject(err); else resolve();
+      };
+
+      const write = (data) => socket.write(data + '\r\n');
+
+      socket.on('data', (chunk) => {
+        buffer += chunk.toString();
+        while (buffer.includes('\r\n')) {
+          const idx = buffer.indexOf('\r\n');
+          const line = buffer.substring(0, idx);
+          buffer = buffer.substring(idx + 2);
+
+          const match = line.match(/^(\d{3}) (.*)/);
+          if (!match) continue;
+
+          const code = match[1];
+
+          switch (step) {
+            case 0:
+              if (code === '220') { write('EHLO weather-bot'); step = 1; }
+              break;
+            case 1:
+              if (code === '250') { write('AUTH LOGIN'); step = 2; }
+              break;
+            case 2:
+              if (code === '334') { write(Buffer.from(user).toString('base64')); step = 3; }
+              break;
+            case 3:
+              if (code === '334') { write(Buffer.from(pass).toString('base64')); step = 4; }
+              break;
+            case 4:
+              if (code === '235') { write(`MAIL FROM:<${user}>`); step = 5; }
+              else done(new Error(`SMTP 认证失败: ${line}`));
+              break;
+            case 5:
+              if (code === '250') { write(`RCPT TO:<${to}>`); step = 6; }
+              break;
+            case 6:
+              if (code === '250') { write('DATA'); step = 7; }
+              break;
+            case 7:
+              if (code === '354') {
+                const subjectEncoded = `=?UTF-8?B?${Buffer.from(subject).toString('base64')}?=`;
+                const bodyEncoded = Buffer.from(body).toString('base64');
+                const emailContent = [
+                  `From: ${user}`,
+                  `To: ${to}`,
+                  `Subject: ${subjectEncoded}`,
+                  'MIME-Version: 1.0',
+                  'Content-Type: text/plain; charset=UTF-8',
+                  'Content-Transfer-Encoding: base64',
+                  '',
+                  bodyEncoded,
+                  '.',
+                ].join('\r\n');
+                write(emailContent);
+                step = 8;
+              }
+              break;
+            case 8:
+              if (code === '250') { write('QUIT'); step = 9; }
+              break;
+            case 9:
+              done();
+              break;
+          }
+        }
+      });
+
+      socket.on('error', (err) => done(err));
+      socket.setTimeout(30000, () => done(new Error('SMTP 连接超时')));
+    });
+  });
+}
+
+async function notify(region, message) {
+  const to = region.email;
+  const subject = `☔ 天气提醒 | ${region.name}`;
+  await sendEmail(to, subject, message);
+  console.log(`已发送邮件到 ${to}`);
 }
