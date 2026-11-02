@@ -1,0 +1,36 @@
+name: weather-bot
+
+# UTC 0-12 点 = 北京时间 8:00-20:00，每小时检查一次
+on:
+  schedule:
+    - cron: "0 0-12 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: weather-bot
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore notified state
+        uses: actions/cache@v4
+        with:
+          path: state
+          key: weather-notify-${{ github.run_id }}
+          restore-keys: weather-notify-
+
+      - name: Check weather and notify
+        env:
+          QQ_SMTP_USER: ${{ secrets.QQ_SMTP_USER }}
+          QQ_SMTP_PASS: ${{ secrets.QQ_SMTP_PASS }}
+          MIN_SOURCES: "1"
+          RAIN_PROB_THRESHOLD: "50"
+        run: node bot.mjs
