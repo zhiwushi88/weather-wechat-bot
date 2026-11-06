@@ -47,7 +47,8 @@ weather-wechat-bot/
    | `QWEATHER_KEY` | 和风天气免费 Key（[dev.qweather.com](https://dev.qweather.com)），增加第三投票源 | 可选 |
    | `OWM_KEY` | [openweathermap.org](https://openweathermap.org/api) 免费 Key | 可选 |
 4. 仓库 → Actions → weather-bot → Run workflow 手动跑一次验证；跑完看日志确认
-5. 完成。之后每天 8–20 点自动运行（注意 GitHub 定时可能延迟 5~30 分钟，属正常）
+5. 完成。之后每天 8–20 点自动运行（注意 GitHub 免费版 schedule 实测会迟到约 4 小时，
+   本仓库已做 cron 补偿，详见「五之二」）
 
 ## 四、部署方式 B：Cloudflare Workers（触发更准点）
 
@@ -68,6 +69,41 @@ npx wrangler deploy
 - ✅ 投票逻辑、去重状态读写、消息组装、语法检查均通过
 - ✅ 未配置推送渠道时会明确报错提示（不会静默失败）
 - ⚠️ 和风/OWM 源需你自己的 Key 后才能参与投票（免费申请，见上表）
+
+## 五之二、GitHub schedule 迟到问题与补偿（2026-11-06 实测）
+
+**结论：GitHub 免费版的 `schedule` 在本仓库上稳定迟到约 4 小时，不是配置错误，调不了。**
+
+实测数据（API 拉的 `created_at`，北京时间）：
+
+| 日期 | 计划 | 实际 | 迟到 |
+|---|---|---|---|
+| 11-03 | 07:30 | 11:58 | +4h28m |
+| 11-04 | 07:30 | 11:07 | +3h37m |
+| 11-05 | 07:30 | 11:38 | +4h08m |
+| 11-06 | 07:30 | 11:35 | +4h05m |
+
+平均 +4h05m。run 的 `created_at` 与 `run_started_at` 只差 1~12 秒，**说明不是排队等机器，
+是 GitHub 调度器本身把触发时间推后了**。GitHub 状态页当时全部 operational，不是故障。
+
+反向验证：手动 `workflow_dispatch` 发出 → 6 秒后 run 创建。**主动触发通道准点，只有 `schedule` 会延迟。**
+
+### 当前采用：cron 提前补偿（方案 B）
+
+`cron: "25 19 * * *"`（UTC 19:25 = 北京 03:25），加上约 4h05m 延迟，落在北京 07:30 前后。
+
+**风险**：延迟量不是常数（波动 ±25 分钟），且若 GitHub 哪天调度恢复正常，邮件会在凌晨 03:25 发出。
+
+### 长期方案：方案 A（尚未实施）
+
+用外部免费定时服务（如 cron-job.org）每天 07:30 调 GitHub API 触发 `workflow_dispatch`。
+实测触发到开跑 6 秒。需要一个 fine-grained PAT（仅本仓库 Actions:write 权限），
+token 会存放在第三方侧。用户 2026-11-06 选择先走方案 B 止血。
+
+### 已知连带问题
+
+跑得晚时，邮件正文仍写“今日 08:00–20:00 预计有雨”，会把已过去的时段算进去。
+时间修正后自然消失。若要根治，可在 `bot.mjs` 里把 `WINDOW_START` 改为 `max(8, 当前小时)`。
 
 ## 六、日常维护
 
